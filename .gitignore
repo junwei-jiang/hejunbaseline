@@ -1,0 +1,10 @@
+log/
+diffusion_renderer/
+hf_cache/
+output/
+LightSwitch/
+Neural_Gaffer/
+sam/
+cosmos_predict1/
+logs/
+debug_tensors/*
