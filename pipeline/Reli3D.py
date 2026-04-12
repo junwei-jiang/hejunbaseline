@@ -27,6 +27,8 @@ class Reli3DPipeline(BaselinePipeline):
         texture_size: int = 1024,
         remesh: str = "none",
         vertex_count: int = -1,
+        convert_source_view_cv_to_reli3d: bool = True,
+        debug: bool = False,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -40,6 +42,8 @@ class Reli3DPipeline(BaselinePipeline):
         self.texture_size = int(texture_size)
         self.remesh = remesh
         self.vertex_count = int(vertex_count)
+        self.convert_source_view_cv_to_reli3d = bool(convert_source_view_cv_to_reli3d)
+        self.debug = bool(debug)
 
         if not self.reli3d_root.exists():
             raise FileNotFoundError(f"ReLi3D root not found: {self.reli3d_root}")
@@ -126,6 +130,21 @@ class Reli3DPipeline(BaselinePipeline):
         model.eval()
         model = model.to(self.device_obj)
         return model
+
+    def _convert_source_view_for_reli3d(self, source_view: torch.Tensor) -> torch.Tensor:
+        if not self.convert_source_view_cv_to_reli3d:
+            return source_view
+        cv_to_blender_cv = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=source_view.dtype,
+            device=source_view.device,
+        )
+        return torch.matmul(source_view, cv_to_blender_cv)
 
     def _build_mapper_batch(
         self,
@@ -247,11 +266,12 @@ class Reli3DPipeline(BaselinePipeline):
             self._write_hdr(target_lighting, hdr_path)
             return mesh_path, hdr_path
 
+        source_view_reli3d = self._convert_source_view_for_reli3d(source_view)
         mapper_batch = self._build_mapper_batch(
             object_uid=sample_key,
             source_images=source_images,
             source_mask=source_mask,
-            source_view=source_view,
+            source_view=source_view_reli3d,
             source_Ks=source_Ks,
         )
 
@@ -467,6 +487,19 @@ class Reli3DPipeline(BaselinePipeline):
                 depth_out[b] = torch.zeros((F, 1, H, W), dtype=torch.float32)
             if mask_np.shape[1:] == (1, H, W):
                 mask_out[b] = torch.from_numpy(mask_np)
+
+            if self.debug:
+                mask_ratio = (mask_np > 0.01).astype(np.float32).mean(axis=(1, 2, 3))
+                depth_ratio = ((np.isfinite(depth_np)) & (depth_np > 0.0)).astype(np.float32).mean(axis=(1, 2, 3))
+                msg_count = min(4, len(mask_ratio))
+                mask_head = ", ".join([f"{x:.3f}" for x in mask_ratio[:msg_count]])
+                depth_head = ", ".join([f"{x:.3f}" for x in depth_ratio[:msg_count]])
+                print(
+                    f"[ReLi3D debug] sample_idx={sample_idx} "
+                    f"mask_nonzero_mean={float(mask_ratio.mean()):.4f} "
+                    f"depth_valid_mean={float(depth_ratio.mean()):.4f} "
+                    f"mask_head=[{mask_head}] depth_head=[{depth_head}]"
+                )
 
         rgb_out = rgb_out.to(device=self.device, dtype=self.dtype)
         depth_out = depth_out.to(device=self.device, dtype=self.dtype)

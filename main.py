@@ -219,6 +219,8 @@ def main(args):
             texture_size=args.reli3d_texture_size,
             remesh=args.reli3d_remesh,
             vertex_count=args.reli3d_vertex_count,
+            convert_source_view_cv_to_reli3d=(not args.reli3d_no_source_view_conversion),
+            debug=args.reli3d_debug,
         )
         dataset = EvalDataset(args.dataset_path, args.pair_info, black_background=True)
     elif args.baseline == "Trained-NeuralGaffer":
@@ -256,6 +258,8 @@ if __name__ == "__main__":
     parser.add_argument("--reli3d_texture_size", type=int, default=1024)
     parser.add_argument("--reli3d_remesh", type=str, default="none", choices=["none", "triangle", "quad"])
     parser.add_argument("--reli3d_vertex_count", type=int, default=-1)
+    parser.add_argument("--reli3d_debug", action='store_true')
+    parser.add_argument("--reli3d_no_source_view_conversion", action='store_true')
 
     args = parser.parse_args()
     
