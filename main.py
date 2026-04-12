@@ -129,7 +129,15 @@ def log_validation(dataloader, pipeline, args, metric_fn):
                 current_eval["pred_image"].append(str(image_path))
 
                 depth_path = view_dir / "pred_depths.png"
-                save_image(relit[b, v], depth_path)
+                if depth_pred is not None:
+                    depth_vis = depth_pred[b, v:v+1]
+                    depth_vis = torch.nan_to_num(depth_vis, nan=0.0, posinf=0.0, neginf=0.0)
+                    dmin = depth_vis.min()
+                    dmax = depth_vis.max()
+                    depth_vis = (depth_vis - dmin) / (dmax - dmin + 1e-8)
+                    save_image(depth_vis, depth_path)
+                else:
+                    save_image(torch.zeros_like(relit[b, v:v+1]), depth_path)
                 current_eval["pred_depth"].append(str(depth_path))
 
                 if args.save_gt:
@@ -240,7 +248,10 @@ def main(args):
     
     # Dataset Setup
     # dataset = EvalDataset(args.dataset_path, args.pair_info)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    eval_batch_size = args.batch_size
+    if args.baseline == "ReLi3D":
+        eval_batch_size = max(1, int(args.reli3d_recon_chunk_size))
+    dataloader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, num_workers=4)
 
     metric_fn = MetricCalculator(device)
 
@@ -276,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--reli3d_export_principal_mode", type=str, default="dataset", choices=["dataset", "center"])
     parser.add_argument("--reli3d_export_fov_mode", type=str, default="xy", choices=["xy", "scalar_x"])
     parser.add_argument("--reli3d_export_coord_system", type=str, default="ogl", choices=["ogl", "blender"])
+    parser.add_argument("--reli3d_recon_chunk_size", type=int, default=1)
 
     args = parser.parse_args()
     

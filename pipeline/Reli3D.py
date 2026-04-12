@@ -365,18 +365,14 @@ class Reli3DPipeline(BaselinePipeline):
 
         src_obj_dir = out_root / case_dir.name
         src_mesh = src_obj_dir / "mesh.glb"
-        src_hdr = src_obj_dir / "illumination.hdr"
-
         if not src_mesh.exists():
             raise FileNotFoundError(
                 f"Official infer finished but mesh not found: {src_mesh}"
             )
 
         shutil.copy2(src_mesh, mesh_path)
-        if src_hdr.exists():
-            shutil.copy2(src_hdr, hdr_path)
-        else:
-            self._write_hdr(target_lighting, hdr_path)
+        # For relighting benchmark, always use dataset target lighting.
+        self._write_hdr(target_lighting, hdr_path)
 
         return mesh_path, hdr_path
 
@@ -478,6 +474,110 @@ class Reli3DPipeline(BaselinePipeline):
         batch_out[Names.BATCH_SIZE] = 1
         return batch_out
 
+    def _sample_paths(self, batch_idx: int, sample_idx: int) -> Tuple[Path, Path, Path]:
+        sample_key = f"s{sample_idx}_b{batch_idx}"
+        sample_dir = self.cache_dir / sample_key
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        mesh_path = sample_dir / "mesh.glb"
+        hdr_path = sample_dir / "illumination.hdr"
+        return sample_dir, mesh_path, hdr_path
+
+    def _prepare_official_meshes_for_batch(self, batch) -> None:
+        if not self.use_official_infer:
+            return
+
+        source_images = batch["source_images"]
+        source_view = batch["source_view"]
+        source_Ks = batch["source_Ks"]
+        source_mask = batch.get("source_mask")
+        target_lighting = batch["target_lighting"]
+
+        if source_mask is None:
+            source_mask = torch.ones_like(source_images[:, :, :1])
+
+        export_root = self.export_case_inputs_dir
+        if export_root is None:
+            export_root = self.cache_dir / "_official_inputs"
+            export_root.mkdir(parents=True, exist_ok=True)
+        out_root = self.cache_dir / "_official_outputs"
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        jobs = []
+        B = source_images.shape[0]
+        for b in range(B):
+            sample_idx = int(batch["idx"][b].item()) if "idx" in batch else b
+            sample_dir, mesh_path, hdr_path = self._sample_paths(b, sample_idx)
+            if mesh_path.exists():
+                # keep benchmark lighting from dataset
+                self._write_hdr(target_lighting[b], hdr_path)
+                continue
+
+            source_view_reli3d = self._convert_source_view_for_reli3d(source_view[b])
+            case_dir = self._export_case_inputs(
+                sample_idx=sample_idx,
+                source_images=source_images[b],
+                source_mask=source_mask[b],
+                source_view=source_view_reli3d,
+                source_Ks=source_Ks[b],
+            )
+            if case_dir is None:
+                raise RuntimeError("Official infer requires exported case inputs, but export failed.")
+            jobs.append(
+                {
+                    "case_name": case_dir.name,
+                    "sample_dir": sample_dir,
+                    "mesh_path": mesh_path,
+                    "hdr_path": hdr_path,
+                    "target_lighting": target_lighting[b],
+                }
+            )
+
+        if not jobs:
+            return
+
+        cmd = [
+            sys.executable,
+            "demos/reli3d/infer_from_transforms.py",
+            "--input-root",
+            str(export_root),
+            "--objects",
+        ]
+        cmd.extend([j["case_name"] for j in jobs])
+        cmd.extend(
+            [
+                "--output-root",
+                str(out_root),
+                "--config",
+                str(self.config_path),
+                "--checkpoint",
+                str(self.checkpoint_path),
+                "--texture-size",
+                str(self.texture_size),
+                "--remesh",
+                str(self.remesh),
+                "--overwrite",
+            ]
+        )
+        if self.vertex_count > 0:
+            cmd += ["--vertex-count", str(self.vertex_count)]
+
+        proc = subprocess.run(cmd, cwd=str(self.reli3d_root), capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Official ReLi3D batch infer failed.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stdout:\n{proc.stdout}\n"
+                f"stderr:\n{proc.stderr}"
+            )
+
+        for j in jobs:
+            src_mesh = out_root / j["case_name"] / "mesh.glb"
+            if not src_mesh.exists():
+                raise FileNotFoundError(f"Official batch infer missing mesh: {src_mesh}")
+            shutil.copy2(src_mesh, j["mesh_path"])
+            # keep benchmark lighting from dataset
+            self._write_hdr(j["target_lighting"], j["hdr_path"])
+
     def _reconstruct_mesh(
         self,
         batch_idx: int,
@@ -488,11 +588,7 @@ class Reli3DPipeline(BaselinePipeline):
         source_Ks: torch.Tensor,
         target_lighting: torch.Tensor,
     ) -> Tuple[Path, Path]:
-        sample_key = f"s{sample_idx}_b{batch_idx}"
-        sample_dir = self.cache_dir / sample_key
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        mesh_path = sample_dir / "mesh.glb"
-        hdr_path = sample_dir / "illumination.hdr"
+        sample_dir, mesh_path, hdr_path = self._sample_paths(batch_idx, sample_idx)
 
         if mesh_path.exists():
             if hdr_path.exists():
@@ -540,12 +636,8 @@ class Reli3DPipeline(BaselinePipeline):
         mesh = mesh_list[-1]
         mesh.export(mesh_path, file_type="glb", include_normals=True)
 
-        Names = self.Names
-        if Names.ENV_MAP in global_dict:
-            env_map = global_dict[Names.ENV_MAP][0].detach().cpu().numpy()
-            cv2.imwrite(str(hdr_path), env_map[..., ::-1])
-        else:
-            self._write_hdr(target_lighting, hdr_path)
+        # For relighting benchmark, always use dataset target lighting.
+        self._write_hdr(target_lighting, hdr_path)
 
         return mesh_path, hdr_path
 
@@ -703,6 +795,9 @@ class Reli3DPipeline(BaselinePipeline):
         if source_mask is None:
             source_mask = torch.ones_like(source_images[:, :, :1])
 
+        if self.use_official_infer:
+            self._prepare_official_meshes_for_batch(batch)
+
         B, F, C, H, W = source_images.shape
         rgb_out = torch.zeros((B, F, 3, H, W), dtype=torch.float32)
         depth_out = torch.zeros((B, F, 1, H, W), dtype=torch.float32)
@@ -711,15 +806,28 @@ class Reli3DPipeline(BaselinePipeline):
         for b in range(B):
             sample_idx = int(batch["idx"][b].item()) if "idx" in batch else b
 
-            mesh_path, hdr_path = self._reconstruct_mesh(
-                batch_idx=b,
-                sample_idx=sample_idx,
-                source_images=source_images[b],
-                source_mask=source_mask[b],
-                source_view=source_view[b],
-                source_Ks=source_Ks[b],
-                target_lighting=target_lighting[b],
-            )
+            if self.use_official_infer:
+                _, mesh_path, hdr_path = self._sample_paths(b, sample_idx)
+                if (not mesh_path.exists()) or (not hdr_path.exists()):
+                    mesh_path, hdr_path = self._reconstruct_mesh(
+                        batch_idx=b,
+                        sample_idx=sample_idx,
+                        source_images=source_images[b],
+                        source_mask=source_mask[b],
+                        source_view=source_view[b],
+                        source_Ks=source_Ks[b],
+                        target_lighting=target_lighting[b],
+                    )
+            else:
+                mesh_path, hdr_path = self._reconstruct_mesh(
+                    batch_idx=b,
+                    sample_idx=sample_idx,
+                    source_images=source_images[b],
+                    source_mask=source_mask[b],
+                    source_view=source_view[b],
+                    source_Ks=source_Ks[b],
+                    target_lighting=target_lighting[b],
+                )
 
             render_view = source_view[b] if self.render_source_for_debug else target_view[b]
             render_Ks = source_Ks[b] if self.render_source_for_debug else target_Ks[b]

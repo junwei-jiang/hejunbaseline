@@ -8,10 +8,49 @@ import bpy
 from mathutils import Matrix
 
 
+def _enable_cycles_gpu(scene):
+    try:
+        prefs = bpy.context.preferences
+        cycles_prefs = prefs.addons["cycles"].preferences
+
+        # Try modern backends first, then CPU fallback.
+        tried = ["OPTIX", "CUDA", "HIP", "METAL", "ONEAPI"]
+        backend_set = False
+        for backend in tried:
+            try:
+                cycles_prefs.compute_device_type = backend
+                backend_set = True
+                break
+            except Exception:
+                continue
+        if not backend_set:
+            cycles_prefs.compute_device_type = "NONE"
+
+        try:
+            cycles_prefs.get_devices()
+        except Exception:
+            pass
+
+        any_gpu = False
+        for d in getattr(cycles_prefs, "devices", []):
+            # Keep CPU disabled for render speed, enable all non-CPU devices.
+            if getattr(d, "type", "") != "CPU":
+                d.use = True
+                any_gpu = True
+            else:
+                d.use = False
+
+        scene.cycles.device = "GPU" if any_gpu else "CPU"
+    except Exception:
+        # Safe fallback to CPU if environment has no GPU support.
+        scene.cycles.device = "CPU"
+
+
 def _reset_scene():
     bpy.ops.wm.read_factory_settings(use_empty=True)
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
+    _enable_cycles_gpu(scene)
     scene.cycles.samples = 64
     scene.render.film_transparent = True
     scene.render.image_settings.file_format = "PNG"
