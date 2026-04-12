@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ class Reli3DPipeline(BaselinePipeline):
         debug: bool = False,
         mapper_dataset_is_repaired: bool = True,
         export_case_inputs_dir: Optional[str] = None,
+        use_official_infer: bool = True,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -47,6 +49,7 @@ class Reli3DPipeline(BaselinePipeline):
         self.convert_source_view_cv_to_reli3d = bool(convert_source_view_cv_to_reli3d)
         self.debug = bool(debug)
         self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
+        self.use_official_infer = bool(use_official_infer)
         self.export_case_inputs_dir = (
             Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
         )
@@ -62,7 +65,9 @@ class Reli3DPipeline(BaselinePipeline):
         self.config_path = self._resolve_config_path(config_path)
         self.checkpoint_path = self._resolve_checkpoint_path(checkpoint_path)
 
-        self.model = self._load_model()
+        self.model = None
+        if not self.use_official_infer:
+            self.model = self._load_model()
 
     def _init_reli3d_imports(self) -> None:
         if str(self.reli3d_root) not in sys.path:
@@ -163,11 +168,13 @@ class Reli3DPipeline(BaselinePipeline):
         source_view: torch.Tensor,
         source_Ks: torch.Tensor,
     ) -> Optional[Path]:
-        if self.export_case_inputs_dir is None:
-            return None
+        export_root = self.export_case_inputs_dir
+        if export_root is None:
+            export_root = self.cache_dir / "_official_inputs"
+            export_root.mkdir(parents=True, exist_ok=True)
 
         case_name = f"sample_{int(sample_idx):06d}"
-        case_dir = self.export_case_inputs_dir / case_name
+        case_dir = export_root / case_name
         rgba_dir = case_dir / "rgba"
         case_dir.mkdir(parents=True, exist_ok=True)
         rgba_dir.mkdir(parents=True, exist_ok=True)
@@ -213,16 +220,79 @@ class Reli3DPipeline(BaselinePipeline):
         if not self._printed_export_hint:
             cmd = (
                 f"python demos/reli3d/infer_from_transforms.py "
-                f"--input-root {self.export_case_inputs_dir} --objects {case_name} "
-                f"--output-root {self.export_case_inputs_dir / 'official_outputs'} --overwrite"
+                f"--input-root {export_root} --objects {case_name} "
+                f"--output-root {export_root / 'official_outputs'} --overwrite"
             )
-            with open(self.export_case_inputs_dir / "official_infer_cmd.txt", "w", encoding="utf-8") as f:
+            with open(export_root / "official_infer_cmd.txt", "w", encoding="utf-8") as f:
                 f.write(cmd + "\n")
             print(f"[ReLi3D export] case exported to: {case_dir}")
-            print(f"[ReLi3D export] official command saved: {self.export_case_inputs_dir / 'official_infer_cmd.txt'}")
+            print(f"[ReLi3D export] official command saved: {export_root / 'official_infer_cmd.txt'}")
             self._printed_export_hint = True
 
         return case_dir
+
+    def _reconstruct_mesh_official(
+        self,
+        case_dir: Path,
+        sample_dir: Path,
+        target_lighting: torch.Tensor,
+    ) -> Tuple[Path, Path]:
+        mesh_path = sample_dir / "mesh.glb"
+        hdr_path = sample_dir / "illumination.hdr"
+
+        out_root = sample_dir / "official_outputs"
+        cmd = [
+            sys.executable,
+            "demos/reli3d/infer_from_transforms.py",
+            "--input-root",
+            str(case_dir.parent),
+            "--objects",
+            case_dir.name,
+            "--output-root",
+            str(out_root),
+            "--config",
+            str(self.config_path),
+            "--checkpoint",
+            str(self.checkpoint_path),
+            "--texture-size",
+            str(self.texture_size),
+            "--remesh",
+            str(self.remesh),
+            "--overwrite",
+        ]
+        if self.vertex_count > 0:
+            cmd += ["--vertex-count", str(self.vertex_count)]
+
+        proc = subprocess.run(
+            cmd,
+            cwd=str(self.reli3d_root),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                "Official ReLi3D infer failed.\n"
+                f"Command: {' '.join(cmd)}\n"
+                f"stdout:\n{proc.stdout}\n"
+                f"stderr:\n{proc.stderr}"
+            )
+
+        src_obj_dir = out_root / case_dir.name
+        src_mesh = src_obj_dir / "mesh.glb"
+        src_hdr = src_obj_dir / "illumination.hdr"
+
+        if not src_mesh.exists():
+            raise FileNotFoundError(
+                f"Official infer finished but mesh not found: {src_mesh}"
+            )
+
+        shutil.copy2(src_mesh, mesh_path)
+        if src_hdr.exists():
+            shutil.copy2(src_hdr, hdr_path)
+        else:
+            self._write_hdr(target_lighting, hdr_path)
+
+        return mesh_path, hdr_path
 
     def _build_mapper_batch(
         self,
@@ -352,6 +422,13 @@ class Reli3DPipeline(BaselinePipeline):
             source_view=source_view_reli3d,
             source_Ks=source_Ks,
         )
+        if self.use_official_infer:
+            return self._reconstruct_mesh_official(
+                case_dir=case_dir,
+                sample_dir=sample_dir,
+                target_lighting=target_lighting,
+            )
+
         mapper_batch = self._build_mapper_batch(
             object_uid=sample_key,
             source_images=source_images,
