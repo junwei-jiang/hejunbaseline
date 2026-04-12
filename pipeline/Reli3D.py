@@ -415,7 +415,7 @@ class Reli3DPipeline(BaselinePipeline):
             return mesh_path, hdr_path
 
         source_view_reli3d = self._convert_source_view_for_reli3d(source_view)
-        self._export_case_inputs(
+        case_dir = self._export_case_inputs(
             sample_idx=sample_idx,
             source_images=source_images,
             source_mask=source_mask,
@@ -423,6 +423,8 @@ class Reli3DPipeline(BaselinePipeline):
             source_Ks=source_Ks,
         )
         if self.use_official_infer:
+            if case_dir is None:
+                raise RuntimeError("Official infer requires exported case inputs, but export failed.")
             return self._reconstruct_mesh_official(
                 case_dir=case_dir,
                 sample_dir=sample_dir,
