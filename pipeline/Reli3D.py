@@ -33,6 +33,7 @@ class Reli3DPipeline(BaselinePipeline):
         mapper_dataset_is_repaired: bool = True,
         export_case_inputs_dir: Optional[str] = None,
         use_official_infer: bool = True,
+        render_source_for_debug: bool = False,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -50,6 +51,8 @@ class Reli3DPipeline(BaselinePipeline):
         self.debug = bool(debug)
         self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
         self.use_official_infer = bool(use_official_infer)
+        self.render_source_for_debug = bool(render_source_for_debug)
+        self._printed_source_render_debug_hint = False
         self.export_case_inputs_dir = (
             Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
         )
@@ -635,11 +638,17 @@ class Reli3DPipeline(BaselinePipeline):
                 target_lighting=target_lighting[b],
             )
 
+            render_view = source_view[b] if self.render_source_for_debug else target_view[b]
+            render_Ks = source_Ks[b] if self.render_source_for_debug else target_Ks[b]
+            if self.render_source_for_debug and (not self._printed_source_render_debug_hint):
+                print("[ReLi3D debug] Rendering with source_view/source_K for sanity check.")
+                self._printed_source_render_debug_hint = True
+
             rgb_np, depth_np, mask_np = self._render_with_blender(
                 mesh_path=mesh_path,
                 hdr_path=hdr_path,
-                target_view=target_view[b],
-                target_Ks=target_Ks[b],
+                target_view=render_view,
+                target_Ks=render_Ks,
                 height=H,
                 width=W,
             )
