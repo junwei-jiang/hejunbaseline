@@ -30,6 +30,7 @@ class Reli3DPipeline(BaselinePipeline):
         convert_source_view_cv_to_reli3d: bool = True,
         debug: bool = False,
         mapper_dataset_is_repaired: bool = True,
+        export_case_inputs_dir: Optional[str] = None,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -46,6 +47,12 @@ class Reli3DPipeline(BaselinePipeline):
         self.convert_source_view_cv_to_reli3d = bool(convert_source_view_cv_to_reli3d)
         self.debug = bool(debug)
         self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
+        self.export_case_inputs_dir = (
+            Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
+        )
+        if self.export_case_inputs_dir is not None:
+            self.export_case_inputs_dir.mkdir(parents=True, exist_ok=True)
+        self._printed_export_hint = False
 
         if not self.reli3d_root.exists():
             raise FileNotFoundError(f"ReLi3D root not found: {self.reli3d_root}")
@@ -147,6 +154,75 @@ class Reli3DPipeline(BaselinePipeline):
             device=source_view.device,
         )
         return torch.matmul(source_view, cv_to_blender_cv)
+
+    def _export_case_inputs(
+        self,
+        sample_idx: int,
+        source_images: torch.Tensor,
+        source_mask: torch.Tensor,
+        source_view: torch.Tensor,
+        source_Ks: torch.Tensor,
+    ) -> Optional[Path]:
+        if self.export_case_inputs_dir is None:
+            return None
+
+        case_name = f"sample_{int(sample_idx):06d}"
+        case_dir = self.export_case_inputs_dir / case_name
+        rgba_dir = case_dir / "rgba"
+        case_dir.mkdir(parents=True, exist_ok=True)
+        rgba_dir.mkdir(parents=True, exist_ok=True)
+
+        F, _, H, W = source_images.shape
+        frames = []
+        for i in range(F):
+            rgb = source_images[i].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
+            rgb_u8 = (rgb * 255.0).astype(np.uint8)
+
+            mask = source_mask[i].detach().cpu().clamp(0, 1).numpy()
+            if mask.ndim == 3:
+                mask = mask[0]
+            alpha_u8 = (mask * 255.0).astype(np.uint8)
+
+            rgba = np.concatenate([rgb_u8, alpha_u8[..., None]], axis=-1)
+            bgra = rgba[..., [2, 1, 0, 3]]
+            fn = f"{i:04d}.png"
+            cv2.imwrite(str(rgba_dir / fn), bgra)
+
+            K = source_Ks[i].detach().cpu().float()
+            fx = float(K[0, 0].item())
+            fy = float(K[1, 1].item())
+            cx = float(K[0, 2].item())
+            cy = float(K[1, 2].item())
+            fov_x = 2.0 * np.arctan(float(W) / (2.0 * max(fx, 1e-8)))
+            fov_y = 2.0 * np.arctan(float(H) / (2.0 * max(fy, 1e-8)))
+
+            frames.append(
+                {
+                    "file_path": f"rgba/{fn}",
+                    "transform_matrix": source_view[i].detach().cpu().tolist(),
+                    "camera_fov": [float(fov_x), float(fov_y)],
+                    "camera_principal_point": [float(cx), float(cy)],
+                    "view_index": i,
+                }
+            )
+
+        transforms = {"object_uid": case_name, "frames": frames}
+        with open(case_dir / "transforms.json", "w", encoding="utf-8") as f:
+            json.dump(transforms, f, indent=2)
+
+        if not self._printed_export_hint:
+            cmd = (
+                f"python demos/reli3d/infer_from_transforms.py "
+                f"--input-root {self.export_case_inputs_dir} --objects {case_name} "
+                f"--output-root {self.export_case_inputs_dir / 'official_outputs'} --overwrite"
+            )
+            with open(self.export_case_inputs_dir / "official_infer_cmd.txt", "w", encoding="utf-8") as f:
+                f.write(cmd + "\n")
+            print(f"[ReLi3D export] case exported to: {case_dir}")
+            print(f"[ReLi3D export] official command saved: {self.export_case_inputs_dir / 'official_infer_cmd.txt'}")
+            self._printed_export_hint = True
+
+        return case_dir
 
     def _build_mapper_batch(
         self,
@@ -269,6 +345,13 @@ class Reli3DPipeline(BaselinePipeline):
             return mesh_path, hdr_path
 
         source_view_reli3d = self._convert_source_view_for_reli3d(source_view)
+        self._export_case_inputs(
+            sample_idx=sample_idx,
+            source_images=source_images,
+            source_mask=source_mask,
+            source_view=source_view_reli3d,
+            source_Ks=source_Ks,
+        )
         mapper_batch = self._build_mapper_batch(
             object_uid=sample_key,
             source_images=source_images,
@@ -513,3 +596,4 @@ def glob_glob(pattern: str) -> List[str]:
     import glob
 
     return glob.glob(pattern)
+

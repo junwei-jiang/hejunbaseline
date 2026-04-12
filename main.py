@@ -222,6 +222,7 @@ def main(args):
             convert_source_view_cv_to_reli3d=(not args.reli3d_no_source_view_conversion),
             debug=args.reli3d_debug,
             mapper_dataset_is_repaired=bool(args.reli3d_mapper_dataset_repaired),
+            export_case_inputs_dir=args.reli3d_export_case_inputs_dir,
         )
         dataset = EvalDataset(args.dataset_path, args.pair_info, black_background=True)
     elif args.baseline == "Trained-NeuralGaffer":
@@ -262,6 +263,7 @@ if __name__ == "__main__":
     parser.add_argument("--reli3d_debug", action='store_true')
     parser.add_argument("--reli3d_no_source_view_conversion", action='store_true')
     parser.add_argument("--reli3d_mapper_dataset_repaired", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--reli3d_export_case_inputs_dir", type=str, default=None)
 
     args = parser.parse_args()
     
