@@ -46,7 +46,7 @@ def _setup_depth_output(depth_dir: str):
     fo = nt.nodes.new(type="CompositorNodeOutputFile")
     fo.base_path = depth_dir
     fo.format.file_format = "OPEN_EXR"
-    fo.format.color_mode = "BW"
+    fo.format.color_mode = "RGB"
     fo.format.color_depth = "32"
     nt.links.new(rl.outputs["Depth"], fo.inputs[0])
     return fo
