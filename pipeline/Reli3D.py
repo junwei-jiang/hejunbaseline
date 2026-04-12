@@ -29,6 +29,7 @@ class Reli3DPipeline(BaselinePipeline):
         vertex_count: int = -1,
         convert_source_view_cv_to_reli3d: bool = True,
         debug: bool = False,
+        mapper_dataset_is_repaired: bool = True,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -44,6 +45,7 @@ class Reli3DPipeline(BaselinePipeline):
         self.vertex_count = int(vertex_count)
         self.convert_source_view_cv_to_reli3d = bool(convert_source_view_cv_to_reli3d)
         self.debug = bool(debug)
+        self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
 
         if not self.reli3d_root.exists():
             raise FileNotFoundError(f"ReLi3D root not found: {self.reli3d_root}")
@@ -212,7 +214,7 @@ class Reli3DPipeline(BaselinePipeline):
             "eval_height": 512,
             "eval_width": 512,
             "binarize_mask": True,
-            "dataset_is_repaired": True,
+            "dataset_is_repaired": self.mapper_dataset_is_repaired,
             "add_pose_noise": False,
             "pose_noise_std_trans": 0.0,
             "pose_noise_std_rot": 0.0,
