@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -343,18 +342,44 @@ class Reli3DPipeline(BaselinePipeline):
                     f"stdout:\n{proc.stdout}\n"
                     f"stderr:\n{proc.stderr}"
                 )
+            done_file = work_dir / "done.txt"
+            rgb_dir = work_dir / "rgb"
+            any_rgb = sorted(rgb_dir.glob("*.png")) if rgb_dir.exists() else []
+            if (not done_file.exists()) and (len(any_rgb) == 0):
+                raise RuntimeError(
+                    "Blender command returned success but render script did not finish.\n"
+                    "This often happens when using a launcher wrapper instead of the real blender binary.\n"
+                    f"Command: {' '.join(cmd)}\n"
+                    f"stdout:\n{proc.stdout}\n"
+                    f"stderr:\n{proc.stderr}"
+                )
 
             rgb_list: List[np.ndarray] = []
             mask_list: List[np.ndarray] = []
             depth_list: List[np.ndarray] = []
+            all_rgb_pngs = sorted((work_dir / "rgb").glob("*.png"))
             for i in range(F):
                 rgba_path = work_dir / "rgb" / f"{i:04d}.png"
+                if not rgba_path.exists():
+                    cand = sorted((work_dir / "rgb").glob(f"{i:04d}*.png"))
+                    if cand:
+                        rgba_path = cand[-1]
+                    elif i < len(all_rgb_pngs):
+                        rgba_path = all_rgb_pngs[i]
                 depth_pattern = str(work_dir / "depth" / f"depth_{i:04d}_*.exr")
                 depth_files = sorted(Path(p) for p in glob_glob(depth_pattern))
 
                 rgba = cv2.imread(str(rgba_path), cv2.IMREAD_UNCHANGED)
                 if rgba is None:
-                    raise FileNotFoundError(f"Missing rendered image: {rgba_path}")
+                    rgb_files = [p.name for p in sorted((work_dir / "rgb").glob("*"))]
+                    depth_files_dbg = [p.name for p in sorted((work_dir / "depth").glob("*"))]
+                    raise FileNotFoundError(
+                        f"Missing rendered image: {rgba_path}\n"
+                        f"Available rgb files: {rgb_files}\n"
+                        f"Available depth files: {depth_files_dbg}\n"
+                        f"Blender stdout:\n{proc.stdout}\n"
+                        f"Blender stderr:\n{proc.stderr}"
+                    )
 
                 if rgba.ndim == 2:
                     rgba = np.stack([rgba, rgba, rgba, np.full_like(rgba, 255)], axis=-1)
