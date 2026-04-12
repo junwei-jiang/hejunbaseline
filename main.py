@@ -225,6 +225,9 @@ def main(args):
             export_case_inputs_dir=args.reli3d_export_case_inputs_dir,
             use_official_infer=bool(args.reli3d_use_official_infer),
             render_source_for_debug=args.reli3d_render_source_for_debug,
+            dump_camera_debug=args.reli3d_dump_camera_debug,
+            export_principal_mode=args.reli3d_export_principal_mode,
+            export_fov_mode=args.reli3d_export_fov_mode,
         )
         dataset = EvalDataset(args.dataset_path, args.pair_info, black_background=True)
     elif args.baseline == "Trained-NeuralGaffer":
@@ -268,6 +271,9 @@ if __name__ == "__main__":
     parser.add_argument("--reli3d_export_case_inputs_dir", type=str, default=None)
     parser.add_argument("--reli3d_use_official_infer", type=int, default=1, choices=[0, 1])
     parser.add_argument("--reli3d_render_source_for_debug", action='store_true')
+    parser.add_argument("--reli3d_dump_camera_debug", action='store_true')
+    parser.add_argument("--reli3d_export_principal_mode", type=str, default="dataset", choices=["dataset", "center"])
+    parser.add_argument("--reli3d_export_fov_mode", type=str, default="xy", choices=["xy", "scalar_x"])
 
     args = parser.parse_args()
     

@@ -34,6 +34,9 @@ class Reli3DPipeline(BaselinePipeline):
         export_case_inputs_dir: Optional[str] = None,
         use_official_infer: bool = True,
         render_source_for_debug: bool = False,
+        dump_camera_debug: bool = False,
+        export_principal_mode: str = "dataset",
+        export_fov_mode: str = "xy",
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -52,6 +55,9 @@ class Reli3DPipeline(BaselinePipeline):
         self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
         self.use_official_infer = bool(use_official_infer)
         self.render_source_for_debug = bool(render_source_for_debug)
+        self.dump_camera_debug = bool(dump_camera_debug)
+        self.export_principal_mode = str(export_principal_mode)
+        self.export_fov_mode = str(export_fov_mode)
         self._printed_source_render_debug_hint = False
         self.export_case_inputs_dir = (
             Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
@@ -184,6 +190,7 @@ class Reli3DPipeline(BaselinePipeline):
 
         F, _, H, W = source_images.shape
         frames = []
+        camera_debug = []
         for i in range(F):
             rgb = source_images[i].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
             rgb_u8 = (rgb * 255.0).astype(np.uint8)
@@ -206,19 +213,71 @@ class Reli3DPipeline(BaselinePipeline):
             fov_x = 2.0 * np.arctan(float(W) / (2.0 * max(fx, 1e-8)))
             fov_y = 2.0 * np.arctan(float(H) / (2.0 * max(fy, 1e-8)))
 
+            if self.export_fov_mode == "scalar_x":
+                camera_fov = [float(fov_x), float(fov_x)]
+            else:
+                camera_fov = [float(fov_x), float(fov_y)]
+
+            if self.export_principal_mode == "center":
+                principal = [float(W * 0.5), float(H * 0.5)]
+            else:
+                principal = [float(cx), float(cy)]
+
+            c2w = source_view[i].detach().cpu().float().numpy()
+            R = c2w[:3, :3]
+            t = c2w[:3, 3]
+            det_r = float(np.linalg.det(R))
+            t_norm = float(np.linalg.norm(t))
+            alpha_ratio = float((alpha_u8 > 0).mean())
+
             frames.append(
                 {
                     "file_path": f"rgba/{fn}",
-                    "transform_matrix": source_view[i].detach().cpu().tolist(),
-                    "camera_fov": [float(fov_x), float(fov_y)],
-                    "camera_principal_point": [float(cx), float(cy)],
+                    "transform_matrix": c2w.tolist(),
+                    "camera_fov": camera_fov,
+                    "camera_principal_point": principal,
                     "view_index": i,
+                }
+            )
+
+            camera_debug.append(
+                {
+                    "view_index": i,
+                    "fx": fx,
+                    "fy": fy,
+                    "cx": cx,
+                    "cy": cy,
+                    "export_principal": principal,
+                    "fov_x": float(fov_x),
+                    "fov_y": float(fov_y),
+                    "export_fov": camera_fov,
+                    "det_R": det_r,
+                    "cam_radius": t_norm,
+                    "alpha_ratio": alpha_ratio,
                 }
             )
 
         transforms = {"object_uid": case_name, "frames": frames}
         with open(case_dir / "transforms.json", "w", encoding="utf-8") as f:
             json.dump(transforms, f, indent=2)
+
+        if self.dump_camera_debug:
+            summary = {
+                "case": case_name,
+                "width": int(W),
+                "height": int(H),
+                "export_principal_mode": self.export_principal_mode,
+                "export_fov_mode": self.export_fov_mode,
+                "det_R_min": float(min(x["det_R"] for x in camera_debug)) if camera_debug else None,
+                "det_R_max": float(max(x["det_R"] for x in camera_debug)) if camera_debug else None,
+                "radius_min": float(min(x["cam_radius"] for x in camera_debug)) if camera_debug else None,
+                "radius_max": float(max(x["cam_radius"] for x in camera_debug)) if camera_debug else None,
+                "alpha_ratio_min": float(min(x["alpha_ratio"] for x in camera_debug)) if camera_debug else None,
+                "alpha_ratio_max": float(max(x["alpha_ratio"] for x in camera_debug)) if camera_debug else None,
+                "views": camera_debug,
+            }
+            with open(case_dir / "camera_debug.json", "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
 
         if not self._printed_export_hint:
             cmd = (
