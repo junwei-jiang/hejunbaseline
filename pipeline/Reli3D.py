@@ -37,6 +37,7 @@ class Reli3DPipeline(BaselinePipeline):
         dump_camera_debug: bool = False,
         export_principal_mode: str = "dataset",
         export_fov_mode: str = "xy",
+        export_coord_system: str = "ogl",
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
@@ -58,6 +59,7 @@ class Reli3DPipeline(BaselinePipeline):
         self.dump_camera_debug = bool(dump_camera_debug)
         self.export_principal_mode = str(export_principal_mode)
         self.export_fov_mode = str(export_fov_mode)
+        self.export_coord_system = str(export_coord_system)
         self._printed_source_render_debug_hint = False
         self.export_case_inputs_dir = (
             Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
@@ -169,6 +171,18 @@ class Reli3DPipeline(BaselinePipeline):
         )
         return torch.matmul(source_view, cv_to_blender_cv)
 
+    def _blender_to_ogl_c2w(self, c2w_blender: np.ndarray) -> np.ndarray:
+        blender_to_gl = np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        return blender_to_gl @ c2w_blender
+
     def _export_case_inputs(
         self,
         sample_idx: int,
@@ -223,9 +237,14 @@ class Reli3DPipeline(BaselinePipeline):
             else:
                 principal = [float(cx), float(cy)]
 
-            c2w = source_view[i].detach().cpu().float().numpy()
-            R = c2w[:3, :3]
-            t = c2w[:3, 3]
+            c2w_blender = source_view[i].detach().cpu().float().numpy()
+            if self.export_coord_system == "ogl":
+                c2w_export = self._blender_to_ogl_c2w(c2w_blender)
+            else:
+                c2w_export = c2w_blender
+
+            R = c2w_export[:3, :3]
+            t = c2w_export[:3, 3]
             det_r = float(np.linalg.det(R))
             t_norm = float(np.linalg.norm(t))
             alpha_ratio = float((alpha_u8 > 0).mean())
@@ -233,7 +252,7 @@ class Reli3DPipeline(BaselinePipeline):
             frames.append(
                 {
                     "file_path": f"rgba/{fn}",
-                    "transform_matrix": c2w.tolist(),
+                    "transform_matrix": c2w_export.tolist(),
                     "camera_fov": camera_fov,
                     "camera_principal_point": principal,
                     "view_index": i,
@@ -257,7 +276,11 @@ class Reli3DPipeline(BaselinePipeline):
                 }
             )
 
-        transforms = {"object_uid": case_name, "frames": frames}
+        transforms = {
+            "object_uid": case_name,
+            "coordinate_system": self.export_coord_system,
+            "frames": frames,
+        }
         with open(case_dir / "transforms.json", "w", encoding="utf-8") as f:
             json.dump(transforms, f, indent=2)
 
@@ -268,6 +291,7 @@ class Reli3DPipeline(BaselinePipeline):
                 "height": int(H),
                 "export_principal_mode": self.export_principal_mode,
                 "export_fov_mode": self.export_fov_mode,
+                "export_coord_system": self.export_coord_system,
                 "det_R_min": float(min(x["det_R"] for x in camera_debug)) if camera_debug else None,
                 "det_R_max": float(max(x["det_R"] for x in camera_debug)) if camera_debug else None,
                 "radius_min": float(min(x["cam_radius"] for x in camera_debug)) if camera_debug else None,
