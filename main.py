@@ -135,7 +135,8 @@ def log_validation(dataloader, pipeline, args, metric_fn):
                 "sample_idx": sample_idx,
                 **sample_metrics,  # Expand all metrics (None values included)
                 "pred_image": [],
-                "pred_depth": []
+                "pred_depth": [],
+                "pred_mask": [],
             }
 
             # Save per view
@@ -148,25 +149,36 @@ def log_validation(dataloader, pipeline, args, metric_fn):
                 save_image(relit[b, v], image_path)
                 current_eval["pred_image"].append(str(image_path))
 
-                depth_path = view_dir / "pred_depths.png"
-                if depth_pred is not None:
-                    depth_vis = depth_pred[b, v:v+1]
-                    depth_vis = torch.nan_to_num(depth_vis, nan=0.0, posinf=0.0, neginf=0.0)
-                    dmin = depth_vis.min()
-                    dmax = depth_vis.max()
-                    depth_vis = (depth_vis - dmin) / (dmax - dmin + 1e-8)
-                    save_image(depth_vis, depth_path)
+                if args.baseline == "ReLi3D":
+                    depth_path = view_dir / "pred_depths.png"
+                    if depth_pred is not None:
+                        depth_vis = depth_pred[b, v:v+1]
+                        depth_vis = torch.nan_to_num(depth_vis, nan=0.0, posinf=0.0, neginf=0.0)
+                        dmin = depth_vis.min()
+                        dmax = depth_vis.max()
+                        depth_vis = (depth_vis - dmin) / (dmax - dmin + 1e-8)
+                        save_image(depth_vis, depth_path)
 
-                    pred_depth_exr = view_dir / "pred_depth.exr"
-                    pred_depth_npy = view_dir / "pred_depth.npy"
-                    _save_depth_raw(depth_pred[b, v], pred_depth_exr, pred_depth_npy)
+                        pred_depth_exr = view_dir / "pred_depth.exr"
+                        pred_depth_npy = view_dir / "pred_depth.npy"
+                        _save_depth_raw(depth_pred[b, v], pred_depth_exr, pred_depth_npy)
+                    else:
+                        save_image(torch.zeros_like(relit[b, v:v+1]), depth_path)
+                    current_eval["pred_depth"].append(str(depth_path))
                 else:
-                    save_image(torch.zeros_like(relit[b, v:v+1]), depth_path)
-                current_eval["pred_depth"].append(str(depth_path))
+                    if depth_pred is not None:
+                        depth_path = view_dir / "pred_depths.png"
+                        save_image(depth_pred[b, v], depth_path)
+                        current_eval["pred_depth"].append(str(depth_path))
+
+                    if mask_pred is not None:
+                        mask_path = view_dir / "pred_mask.png"
+                        save_image(mask_pred[b, v], mask_path)
+                        current_eval["pred_mask"].append(str(mask_path))
 
                 if args.save_gt:
                     save_image(filtered_batch["target_images"][b, v], view_dir / "gt.png")
-                    if depth_gt is not None:
+                    if (args.baseline == "ReLi3D") and (depth_gt is not None):
                         gt_depth_exr = view_dir / "gt_depth.exr"
                         gt_depth_npy = view_dir / "gt_depth.npy"
                         _save_depth_raw(depth_gt[b, v], gt_depth_exr, gt_depth_npy)
