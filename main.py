@@ -9,6 +9,7 @@ import logging
 import argparse
 import warnings
 import numpy as np
+import cv2
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import DataLoader
@@ -28,6 +29,14 @@ logger = logging.getLogger(__name__)
 def get_device():
     return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def _save_depth_raw(depth_1hw: torch.Tensor, exr_path: Path, npy_path: Path) -> None:
+    d = depth_1hw.detach().cpu().float()
+    if d.ndim == 3:
+        d = d[0]
+    d = torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+    d_np = d.numpy().astype(np.float32)
+    np.save(npy_path, d_np)
+    cv2.imwrite(str(exr_path), d_np)
 @torch.no_grad()
 def log_validation(dataloader, pipeline, args, metric_fn):
     device = get_device()
@@ -98,14 +107,25 @@ def log_validation(dataloader, pipeline, args, metric_fn):
             meta = data_pairs[sample_idx]
             
             # 🔹 安全獲取所有可選輸入（不存在則為 None）
+            mask_pred_b = mask_pred[b:b+1] if mask_pred is not None else None
+            mask_gt_b = mask_gt[b:b+1] if mask_gt is not None else None
+            depth_pred_b = depth_pred[b:b+1] if depth_pred is not None else None
+            depth_gt_b = depth_gt[b:b+1] if depth_gt is not None else None
+            if depth_pred_b is not None:
+                finite_ok = torch.isfinite(depth_pred_b).all().item()
+                nonzero = (depth_pred_b.abs().sum() > 0).item()
+                if (not finite_ok) or (not nonzero):
+                    depth_pred_b = None
+                    depth_gt_b = None
+
             metric_vals = metric_fn(
-                relit[b:b+1], 
+                relit[b:b+1],
                 targets[b:b+1],
-                mask_pred=mask_pred,   # None if not present
-                mask_gt=mask_gt,                              # None if not present
-                depth_pred=depth_pred,  # None if not present
-                depth_gt=depth_gt,      # None if not present
-                average=True  # ✅ Returns scalars or None
+                mask_pred=mask_pred_b,
+                mask_gt=mask_gt_b,
+                depth_pred=depth_pred_b,
+                depth_gt=depth_gt_b,
+                average=True
             )
             
             # Build {key: value} dict for easy access
@@ -136,12 +156,20 @@ def log_validation(dataloader, pipeline, args, metric_fn):
                     dmax = depth_vis.max()
                     depth_vis = (depth_vis - dmin) / (dmax - dmin + 1e-8)
                     save_image(depth_vis, depth_path)
+
+                    pred_depth_exr = view_dir / "pred_depth.exr"
+                    pred_depth_npy = view_dir / "pred_depth.npy"
+                    _save_depth_raw(depth_pred[b, v], pred_depth_exr, pred_depth_npy)
                 else:
                     save_image(torch.zeros_like(relit[b, v:v+1]), depth_path)
                 current_eval["pred_depth"].append(str(depth_path))
 
                 if args.save_gt:
                     save_image(filtered_batch["target_images"][b, v], view_dir / "gt.png")
+                    if depth_gt is not None:
+                        gt_depth_exr = view_dir / "gt_depth.exr"
+                        gt_depth_npy = view_dir / "gt_depth.npy"
+                        _save_depth_raw(depth_gt[b, v], gt_depth_exr, gt_depth_npy)
                 if args.save_ref:
                     save_image(filtered_batch["source_images"][b, v], view_dir / "ref.png")
 

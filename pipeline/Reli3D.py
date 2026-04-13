@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -753,8 +754,13 @@ class Reli3DPipeline(BaselinePipeline):
                 mask = (rgba[..., 3:4].astype(np.float32) / 255.0).clip(0.0, 1.0)
 
                 if depth_files:
-                    depth = self._read_exr_depth(depth_files[-1])
+                    depth = self._read_exr_depth(depth_files[-1], height=height, width=width)
                 else:
+                    depth_files_dbg = [p.name for p in sorted((work_dir / "depth").glob("*"))]
+                    warnings.warn(
+                        "Missing rendered depth EXR; fallback to zeros. "
+                        f"view={i}, pattern={depth_pattern}, available={depth_files_dbg}"
+                    )
                     depth = np.zeros((height, width, 1), dtype=np.float32)
 
                 rgb_list.append(np.transpose(rgb, (2, 0, 1)))
@@ -766,7 +772,7 @@ class Reli3DPipeline(BaselinePipeline):
             mask_arr = np.stack(mask_list, axis=0).astype(np.float32)
             return rgb_arr, depth_arr, mask_arr
 
-    def _read_exr_depth(self, exr_path: Path) -> np.ndarray:
+    def _read_exr_depth(self, exr_path: Path, height: int, width: int) -> np.ndarray:
         try:
             import OpenEXR
             import Imath
@@ -780,8 +786,9 @@ class Reli3DPipeline(BaselinePipeline):
             exr.close()
             depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
             return depth[..., None]
-        except Exception:
-            return np.zeros((1, 1, 1), dtype=np.float32)
+        except Exception as e:
+            warnings.warn(f"Failed to read EXR depth {exr_path}; fallback to zeros. err={e}")
+            return np.zeros((height, width, 1), dtype=np.float32)
 
     def __call__(self, batch, **kwargs):
         source_images = batch["source_images"]
@@ -866,7 +873,7 @@ class Reli3DPipeline(BaselinePipeline):
                 )
 
         rgb_out = rgb_out.to(device=self.device, dtype=self.dtype)
-        depth_out = depth_out.to(device=self.device, dtype=self.dtype)
+        depth_out = depth_out.to(device=self.device, dtype=torch.float32)
         mask_out = mask_out.to(device=self.device, dtype=self.dtype)
         return rgb_out, depth_out, mask_out
 
