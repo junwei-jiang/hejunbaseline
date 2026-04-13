@@ -763,6 +763,12 @@ class Reli3DPipeline(BaselinePipeline):
                     )
                     depth = np.zeros((height, width, 1), dtype=np.float32)
 
+                # Align background convention with dataset GT depth: background should be 0.
+                # Also suppress invalid "far" sentinels from EXR reader/writer pipelines.
+                fg = mask > 0.5
+                depth = np.where(fg, depth, 0.0).astype(np.float32)
+                depth = np.where((depth > 0.0) & (depth < 1e6), depth, 0.0).astype(np.float32)
+
                 rgb_list.append(np.transpose(rgb, (2, 0, 1)))
                 mask_list.append(np.transpose(mask, (2, 0, 1)))
                 depth_list.append(np.transpose(depth, (2, 0, 1)))
