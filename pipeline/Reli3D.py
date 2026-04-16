@@ -848,14 +848,63 @@ class Reli3DPipeline(BaselinePipeline):
                 print("[ReLi3D debug] Rendering with source_view/source_K for sanity check.")
                 self._printed_source_render_debug_hint = True
 
-            rgb_np, depth_np, mask_np = self._render_with_blender(
-                mesh_path=mesh_path,
-                hdr_path=hdr_path,
-                target_view=render_view,
-                target_Ks=render_Ks,
-                height=H,
-                width=W,
-            )
+            try:
+                rgb_np, depth_np, mask_np = self._render_with_blender(
+                    mesh_path=mesh_path,
+                    hdr_path=hdr_path,
+                    target_view=render_view,
+                    target_Ks=render_Ks,
+                    height=H,
+                    width=W,
+                )
+            except RuntimeError as e:
+                err = str(e)
+                bad_gltf = ("Bad glTF" in err) or ("json contained NaN" in err)
+                retried = False
+
+                if bad_gltf and mesh_path.exists():
+                    retried = True
+                    warnings.warn(
+                        f"[ReLi3D] sample_idx={sample_idx}: bad GLB detected, deleting cached mesh and retrying once."
+                    )
+                    try:
+                        mesh_path.unlink()
+                    except Exception as unlink_err:
+                        warnings.warn(
+                            f"[ReLi3D] sample_idx={sample_idx}: failed to delete cached mesh {mesh_path}. err={unlink_err}"
+                        )
+
+                    try:
+                        mesh_path, hdr_path = self._reconstruct_mesh(
+                            batch_idx=b,
+                            sample_idx=sample_idx,
+                            source_images=source_images[b],
+                            source_mask=source_mask[b],
+                            source_view=source_view[b],
+                            source_Ks=source_Ks[b],
+                            target_lighting=target_lighting[b],
+                        )
+                        rgb_np, depth_np, mask_np = self._render_with_blender(
+                            mesh_path=mesh_path,
+                            hdr_path=hdr_path,
+                            target_view=render_view,
+                            target_Ks=render_Ks,
+                            height=H,
+                            width=W,
+                        )
+                    except Exception as retry_err:
+                        warnings.warn(
+                            f"[ReLi3D] sample_idx={sample_idx}: retry failed, skip this case. err={retry_err}"
+                        )
+                        mask_out[b] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+                        continue
+
+                if not retried:
+                    warnings.warn(
+                        f"[ReLi3D] sample_idx={sample_idx}: render failed, skip this case. err={e}"
+                    )
+                    mask_out[b] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+                    continue
 
             rgb_out[b] = torch.from_numpy(rgb_np)
             if depth_np.shape[1:] == (1, H, W):
