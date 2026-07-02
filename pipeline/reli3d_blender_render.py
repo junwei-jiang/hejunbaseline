@@ -51,7 +51,13 @@ def _reset_scene():
     scene = bpy.context.scene
     scene.render.engine = "CYCLES"
     _enable_cycles_gpu(scene)
-    scene.cycles.samples = 64
+    scene.cycles.samples = 128
+    scene.cycles.diffuse_bounces = 1
+    scene.cycles.glossy_bounces = 1
+    scene.cycles.transparent_max_bounces = 3
+    scene.cycles.transmission_bounces = 3
+    scene.cycles.filter_width = 0.01
+    scene.cycles.use_denoising = True
     scene.render.film_transparent = True
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"

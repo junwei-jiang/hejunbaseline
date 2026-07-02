@@ -259,30 +259,14 @@ def main(args):
         pipeline = Reli3DPipeline(
             device=str(device),
             dtype=torch.float32,
-            reli3d_root=args.reli3d_root,
-            config_path=args.reli3d_config,
-            checkpoint_path=args.reli3d_checkpoint,
-            blender_path=args.reli3d_blender_path,
-            cache_dir=args.reli3d_cache_dir,
-            texture_size=args.reli3d_texture_size,
-            remesh=args.reli3d_remesh,
-            vertex_count=args.reli3d_vertex_count,
-            convert_source_view_cv_to_reli3d=(not args.reli3d_no_source_view_conversion),
-            debug=args.reli3d_debug,
-            mapper_dataset_is_repaired=bool(args.reli3d_mapper_dataset_repaired),
-            export_case_inputs_dir=args.reli3d_export_case_inputs_dir,
-            use_official_infer=bool(args.reli3d_use_official_infer),
-            render_source_for_debug=args.reli3d_render_source_for_debug,
-            dump_camera_debug=args.reli3d_dump_camera_debug,
-            export_principal_mode=args.reli3d_export_principal_mode,
-            export_fov_mode=args.reli3d_export_fov_mode,
-            export_coord_system=args.reli3d_export_coord_system,
+            output_dir=args.output_dir,
         )
+        pipeline.recon_chunk_size = max(1, int(args.batch_size))
         dataset = EvalDataset(args.dataset_path, args.pair_info, black_background=True)
     elif args.baseline == "Trained-NeuralGaffer":
         from pipeline.NeuralGaffer import NeuralGafferPipeline
-        raise NotImplementedError(f"Baseline {args.baseline} not supported.")
-        # pipeline = DiffusionRendererPipeline(resume_from_checkpoint)
+        pipeline = NeuralGafferPipeline(resume_from_checkpoint="Neural_Gaffer/neural_gaffer_res256/checkpoint-100000")
+        dataset = EvalDataset(args.dataset_path, args.pair_info, black_background=True)
     else:
         raise NotImplementedError(f"Baseline {args.baseline} not supported.")
     
@@ -290,7 +274,7 @@ def main(args):
     # dataset = EvalDataset(args.dataset_path, args.pair_info)
     eval_batch_size = args.batch_size
     if args.baseline == "ReLi3D":
-        eval_batch_size = max(1, int(args.reli3d_recon_chunk_size))
+        eval_batch_size = pipeline.recon_chunk_size
     dataloader = DataLoader(dataset, batch_size=eval_batch_size, shuffle=False, num_workers=4)
 
     metric_fn = MetricCalculator(device)
@@ -309,25 +293,6 @@ if __name__ == "__main__":
     parser.add_argument("--pair_info", type=str, default='/media/HDD1/hejun/LavalObjaverseDataset/experimental_pair/1_to_1_mapping_pairs.json')
     parser.add_argument("--save_gt", action='store_true')
     parser.add_argument("--save_ref", action='store_true')
-    parser.add_argument("--reli3d_root", type=str, default="ReLi3D")
-    parser.add_argument("--reli3d_config", type=str, default=None)
-    parser.add_argument("--reli3d_checkpoint", type=str, default=None)
-    parser.add_argument("--reli3d_blender_path", type=str, default="blender")
-    parser.add_argument("--reli3d_cache_dir", type=str, default="./output/reli3d_cache")
-    parser.add_argument("--reli3d_texture_size", type=int, default=1024)
-    parser.add_argument("--reli3d_remesh", type=str, default="none", choices=["none", "triangle", "quad"])
-    parser.add_argument("--reli3d_vertex_count", type=int, default=-1)
-    parser.add_argument("--reli3d_debug", action='store_true')
-    parser.add_argument("--reli3d_no_source_view_conversion", action='store_true')
-    parser.add_argument("--reli3d_mapper_dataset_repaired", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--reli3d_export_case_inputs_dir", type=str, default=None)
-    parser.add_argument("--reli3d_use_official_infer", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--reli3d_render_source_for_debug", action='store_true')
-    parser.add_argument("--reli3d_dump_camera_debug", action='store_true')
-    parser.add_argument("--reli3d_export_principal_mode", type=str, default="dataset", choices=["dataset", "center"])
-    parser.add_argument("--reli3d_export_fov_mode", type=str, default="xy", choices=["xy", "scalar_x"])
-    parser.add_argument("--reli3d_export_coord_system", type=str, default="ogl", choices=["ogl", "blender"])
-    parser.add_argument("--reli3d_recon_chunk_size", type=int, default=1)
 
     args = parser.parse_args()
     

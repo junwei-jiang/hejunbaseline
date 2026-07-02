@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+import hashlib
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,74 +13,161 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as Fnn
 
 from pipeline import BaselinePipeline
 
+RELI3D_SETTINGS: Dict[str, Any] = {
+    # Paths
+    "reli3d_root": "./ReLi3D",
+    "config_path": "./ReLi3D/artifacts/model/config.yaml",
+    "checkpoint_path": "./ReLi3D/artifacts/model/reli3d_final.ckpt",
+    "blender_path": "/media/HDD2/junwei/blender-3.6.23-linux-x64/blender",
+    # Runtime/cache
+    "cache_subdir": "reli3d_cache",
+    # ReLi3D generation options
+    "texture_size": 1024,
+    "remesh": "none",  # one of: none / triangle / quad
+    "vertex_count": -1,
+    # Integration choices (fixed defaults for this project)
+    "use_official_infer": True,
+    "mapper_dataset_is_repaired": True,
+    "convert_source_view_cv_to_reli3d": True,
+    "export_principal_mode": "dataset",  # dataset / center
+    "export_fov_mode": "xy",             # xy / scalar_x
+    "export_coord_system": "ogl",        # ogl / blender
+    # Source mask choice for ReLi3D input: source / ones / segment / rgb_black_threshold
+    "source_mask_mode": "ones",
+    # Used when source_mask_mode == "rgb_black_threshold":
+    # foreground = (R + G + B) >= rgb_black_sum_threshold
+    "rgb_black_sum_threshold": 0.01,
+    "segment_sam_checkpoint": "./sam/sam_vit_h_4b8939.pth",
+    "segment_device_id": 0,
+    "segment_target_size": 512,
+    # Optional verbose logging
+    "debug": False,
+}
+
 
 class Reli3DPipeline(BaselinePipeline):
+    @staticmethod
+    def settings() -> Dict[str, Any]:
+        return dict(RELI3D_SETTINGS)
+
     def __init__(
         self,
         device: str = "cuda",
         dtype: torch.dtype = torch.float32,
-        reli3d_root: str = "ReLi3D",
-        config_path: Optional[str] = None,
-        checkpoint_path: Optional[str] = None,
-        blender_path: str = "blender",
-        cache_dir: str = "./output/reli3d_cache",
-        texture_size: int = 1024,
-        remesh: str = "none",
-        vertex_count: int = -1,
-        convert_source_view_cv_to_reli3d: bool = True,
-        debug: bool = False,
-        mapper_dataset_is_repaired: bool = True,
-        export_case_inputs_dir: Optional[str] = None,
-        use_official_infer: bool = True,
-        render_source_for_debug: bool = False,
-        dump_camera_debug: bool = False,
-        export_principal_mode: str = "dataset",
-        export_fov_mode: str = "xy",
-        export_coord_system: str = "ogl",
+        output_dir: Optional[str] = None,
     ):
         super().__init__(device=device, dtype=dtype)
         self.device_obj = torch.device(
             "cuda" if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         )
 
-        self.reli3d_root = Path(reli3d_root).resolve()
-        self.blender_path = blender_path
-        self.cache_dir = Path(cache_dir).resolve()
+        cfg = self.settings()
+
+        self.reli3d_root = Path(cfg["reli3d_root"]).resolve()
+        self.blender_path = str(cfg["blender_path"])
+        cache_base = Path(output_dir).resolve() if output_dir else Path("./output").resolve()
+        self.cache_dir = (cache_base / str(cfg["cache_subdir"])).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.texture_size = int(texture_size)
-        self.remesh = remesh
-        self.vertex_count = int(vertex_count)
-        self.convert_source_view_cv_to_reli3d = bool(convert_source_view_cv_to_reli3d)
-        self.debug = bool(debug)
-        self.mapper_dataset_is_repaired = bool(mapper_dataset_is_repaired)
-        self.use_official_infer = bool(use_official_infer)
-        self.render_source_for_debug = bool(render_source_for_debug)
-        self.dump_camera_debug = bool(dump_camera_debug)
-        self.export_principal_mode = str(export_principal_mode)
-        self.export_fov_mode = str(export_fov_mode)
-        self.export_coord_system = str(export_coord_system)
-        self._printed_source_render_debug_hint = False
-        self.export_case_inputs_dir = (
-            Path(export_case_inputs_dir).resolve() if export_case_inputs_dir else None
+        self.texture_size = int(cfg["texture_size"])
+        self.remesh = str(cfg["remesh"])
+        self.vertex_count = int(cfg["vertex_count"])
+        self.convert_source_view_cv_to_reli3d = bool(cfg["convert_source_view_cv_to_reli3d"])
+        self.debug = bool(cfg["debug"])
+        self.mapper_dataset_is_repaired = bool(cfg["mapper_dataset_is_repaired"])
+        self.use_official_infer = bool(cfg["use_official_infer"])
+        self.export_principal_mode = str(cfg["export_principal_mode"])
+        self.export_fov_mode = str(cfg["export_fov_mode"])
+        self.export_coord_system = str(cfg["export_coord_system"])
+        self.source_mask_mode = str(cfg.get("source_mask_mode", "ones")).strip().lower()
+        self.rgb_black_sum_threshold = float(cfg.get("rgb_black_sum_threshold", 0.01))
+        self.segment_sam_checkpoint = str(
+            cfg.get("segment_sam_checkpoint", "./sam/sam_vit_h_4b8939.pth")
         )
-        if self.export_case_inputs_dir is not None:
-            self.export_case_inputs_dir.mkdir(parents=True, exist_ok=True)
+        self.segment_device_id = int(cfg.get("segment_device_id", 0))
+        self.segment_target_size = int(cfg.get("segment_target_size", 512))
+        self.export_case_inputs_dir = None
         self._printed_export_hint = False
+        self._segment_predictor = None
+
+        if self.source_mask_mode not in {"source", "ones", "segment", "rgb_black_threshold"}:
+            raise ValueError(
+                "RELI3D_SETTINGS['source_mask_mode'] must be one of "
+                "'source' / 'ones' / 'segment' / 'rgb_black_threshold'."
+            )
 
         if not self.reli3d_root.exists():
             raise FileNotFoundError(f"ReLi3D root not found: {self.reli3d_root}")
 
         self._init_reli3d_imports()
 
-        self.config_path = self._resolve_config_path(config_path)
-        self.checkpoint_path = self._resolve_checkpoint_path(checkpoint_path)
+        self.config_path = self._resolve_config_path(cfg.get("config_path"))
+        self.checkpoint_path = self._resolve_checkpoint_path(cfg.get("checkpoint_path"))
 
         self.model = None
         if not self.use_official_infer:
             self.model = self._load_model()
+
+    def _get_segment_predictor(self):
+        if self._segment_predictor is None:
+            from pipeline.segment import sam_init
+
+            self._segment_predictor = sam_init(
+                path=self.segment_sam_checkpoint,
+                device_id=self.segment_device_id,
+            )
+        return self._segment_predictor
+
+    def _segment_mask(self, source_images: torch.Tensor) -> torch.Tensor:
+        from pipeline.segment import segment_images
+
+        B, F, _, H, W = source_images.shape
+        predictor = self._get_segment_predictor()
+
+        # segment.py expects one scalar target_size; run there first, then resize back.
+        target_size = int(self.segment_target_size)
+        _, mask = segment_images(
+            predictor=predictor,
+            images=source_images,
+            target_size=target_size,
+        )
+        if mask.shape[-2:] != (H, W):
+            mask_bf = mask.reshape(B * F, 1, mask.shape[-2], mask.shape[-1])
+            mask_bf = Fnn.interpolate(mask_bf, size=(H, W), mode="bilinear", align_corners=False)
+            mask = mask_bf.reshape(B, F, 1, H, W)
+        return mask.clamp(0.0, 1.0).to(device=source_images.device, dtype=source_images.dtype)
+
+    def _resolve_source_mask(self, batch: Dict[str, Any], source_images: torch.Tensor) -> torch.Tensor:
+        if self.source_mask_mode == "ones":
+            return torch.ones_like(source_images[:, :, :1])
+
+        if self.source_mask_mode == "source":
+            source_mask = batch.get("source_mask")
+            if source_mask is None:
+                warnings.warn(
+                    "[ReLi3D] source_mask_mode='source' but source_mask is missing; fallback to ones."
+                )
+                return torch.ones_like(source_images[:, :, :1])
+            return source_mask
+
+        if self.source_mask_mode == "rgb_black_threshold":
+            # source_images: [B, F, 3, H, W], values in [0, 1]
+            rgb_sum = source_images.sum(dim=2, keepdim=True)
+            mask = (rgb_sum >= self.rgb_black_sum_threshold).to(dtype=source_images.dtype)
+            return mask
+
+        # self.source_mask_mode == "segment"
+        try:
+            return self._segment_mask(source_images)
+        except Exception as e:
+            warnings.warn(
+                "[ReLi3D] source_mask_mode='segment' failed; fallback to ones. "
+                f"err={e}"
+            )
+            return torch.ones_like(source_images[:, :, :1])
 
     def _init_reli3d_imports(self) -> None:
         if str(self.reli3d_root) not in sys.path:
@@ -110,7 +198,7 @@ class Reli3DPipeline(BaselinePipeline):
                     p = alt
         if not p.exists():
             raise FileNotFoundError(
-                f"ReLi3D config not found: {p}. Please set --reli3d_config."
+                f"ReLi3D config not found: {p}. Please edit RELI3D_SETTINGS in pipeline/Reli3D.py."
             )
         return p
 
@@ -127,7 +215,7 @@ class Reli3DPipeline(BaselinePipeline):
                 ).resolve()
         if not p.exists():
             raise FileNotFoundError(
-                f"ReLi3D checkpoint not found: {p}. Please set --reli3d_checkpoint."
+                f"ReLi3D checkpoint not found: {p}. Please edit RELI3D_SETTINGS in pipeline/Reli3D.py."
             )
         return p
 
@@ -205,7 +293,6 @@ class Reli3DPipeline(BaselinePipeline):
 
         F, _, H, W = source_images.shape
         frames = []
-        camera_debug = []
         for i in range(F):
             rgb = source_images[i].detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
             rgb_u8 = (rgb * 255.0).astype(np.uint8)
@@ -260,23 +347,6 @@ class Reli3DPipeline(BaselinePipeline):
                 }
             )
 
-            camera_debug.append(
-                {
-                    "view_index": i,
-                    "fx": fx,
-                    "fy": fy,
-                    "cx": cx,
-                    "cy": cy,
-                    "export_principal": principal,
-                    "fov_x": float(fov_x),
-                    "fov_y": float(fov_y),
-                    "export_fov": camera_fov,
-                    "det_R": det_r,
-                    "cam_radius": t_norm,
-                    "alpha_ratio": alpha_ratio,
-                }
-            )
-
         transforms = {
             "object_uid": case_name,
             "coordinate_system": self.export_coord_system,
@@ -284,25 +354,6 @@ class Reli3DPipeline(BaselinePipeline):
         }
         with open(case_dir / "transforms.json", "w", encoding="utf-8") as f:
             json.dump(transforms, f, indent=2)
-
-        if self.dump_camera_debug:
-            summary = {
-                "case": case_name,
-                "width": int(W),
-                "height": int(H),
-                "export_principal_mode": self.export_principal_mode,
-                "export_fov_mode": self.export_fov_mode,
-                "export_coord_system": self.export_coord_system,
-                "det_R_min": float(min(x["det_R"] for x in camera_debug)) if camera_debug else None,
-                "det_R_max": float(max(x["det_R"] for x in camera_debug)) if camera_debug else None,
-                "radius_min": float(min(x["cam_radius"] for x in camera_debug)) if camera_debug else None,
-                "radius_max": float(max(x["cam_radius"] for x in camera_debug)) if camera_debug else None,
-                "alpha_ratio_min": float(min(x["alpha_ratio"] for x in camera_debug)) if camera_debug else None,
-                "alpha_ratio_max": float(max(x["alpha_ratio"] for x in camera_debug)) if camera_debug else None,
-                "views": camera_debug,
-            }
-            with open(case_dir / "camera_debug.json", "w", encoding="utf-8") as f:
-                json.dump(summary, f, indent=2)
 
         if not self._printed_export_hint:
             cmd = (
@@ -483,6 +534,24 @@ class Reli3DPipeline(BaselinePipeline):
         hdr_path = sample_dir / "illumination.hdr"
         return sample_dir, mesh_path, hdr_path
 
+    def _sample_idx_from_batch(self, batch: Dict[str, Any], b: int) -> int:
+        if "idx" in batch:
+            try:
+                return int(batch["idx"][b].item())
+            except Exception:
+                pass
+
+        if "meta" in batch:
+            try:
+                meta_v = batch["meta"][b]
+                meta_s = str(meta_v)
+                # Stable 32-bit id from meta string, avoid always using b=0 in batch_size=1.
+                return int(hashlib.md5(meta_s.encode("utf-8")).hexdigest()[:8], 16)
+            except Exception:
+                pass
+
+        return int(b)
+
     def _prepare_official_meshes_for_batch(self, batch) -> None:
         if not self.use_official_infer:
             return
@@ -490,11 +559,8 @@ class Reli3DPipeline(BaselinePipeline):
         source_images = batch["source_images"]
         source_view = batch["source_view"]
         source_Ks = batch["source_Ks"]
-        source_mask = batch.get("source_mask")
+        source_mask = self._resolve_source_mask(batch, source_images)
         target_lighting = batch["target_lighting"]
-
-        if source_mask is None:
-            source_mask = torch.ones_like(source_images[:, :, :1])
 
         export_root = self.export_case_inputs_dir
         if export_root is None:
@@ -506,7 +572,7 @@ class Reli3DPipeline(BaselinePipeline):
         jobs = []
         B = source_images.shape[0]
         for b in range(B):
-            sample_idx = int(batch["idx"][b].item()) if "idx" in batch else b
+            sample_idx = self._sample_idx_from_batch(batch, b)
             sample_dir, mesh_path, hdr_path = self._sample_paths(b, sample_idx)
             if mesh_path.exists():
                 # keep benchmark lighting from dataset
@@ -615,7 +681,7 @@ class Reli3DPipeline(BaselinePipeline):
             )
 
         mapper_batch = self._build_mapper_batch(
-            object_uid=sample_key,
+            object_uid=f"s{sample_idx}_b{batch_idx}",
             source_images=source_images,
             source_mask=source_mask,
             source_view=source_view_reli3d,
@@ -798,15 +864,13 @@ class Reli3DPipeline(BaselinePipeline):
 
     def __call__(self, batch, **kwargs):
         source_images = batch["source_images"]
+        source_depths = batch.get("source_depths")
         source_view = batch["source_view"]
         source_Ks = batch["source_Ks"]
         target_view = batch["target_view"]
         target_Ks = batch["target_Ks"]
         target_lighting = batch["target_lighting"]
-        source_mask = batch.get("source_mask")
-
-        if source_mask is None:
-            source_mask = torch.ones_like(source_images[:, :, :1])
+        source_mask = self._resolve_source_mask(batch, source_images)
 
         if self.use_official_infer:
             self._prepare_official_meshes_for_batch(batch)
@@ -816,8 +880,41 @@ class Reli3DPipeline(BaselinePipeline):
         depth_out = torch.zeros((B, F, 1, H, W), dtype=torch.float32)
         mask_out = torch.ones((B, F, 1, H, W), dtype=torch.float32)
 
+        def _fit_frames(x: torch.Tensor, out_f: int) -> torch.Tensor:
+            """Adapt per-sample [F, C, H, W] tensor to out_f views by crop/pad-repeat."""
+            in_f = int(x.shape[0])
+            if in_f == out_f:
+                return x
+            if in_f > out_f:
+                return x[:out_f]
+            # in_f < out_f: repeat last frame
+            pad = x[-1:].repeat(out_f - in_f, 1, 1, 1)
+            return torch.cat([x, pad], dim=0)
+
+        def _fallback_to_source(b_idx: int) -> None:
+            # RGB fallback: use source RGB directly.
+            rgb_fb = _fit_frames(source_images[b_idx].detach().cpu().float(), F)
+            rgb_out[b_idx] = rgb_fb
+
+            # Depth fallback: prefer source depth if present, otherwise zeros.
+            if source_depths is not None:
+                depth_fb = _fit_frames(source_depths[b_idx].detach().cpu().float(), F)
+                if depth_fb.shape[1:] == (1, H, W):
+                    depth_out[b_idx] = depth_fb
+                else:
+                    depth_out[b_idx] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+            else:
+                depth_out[b_idx] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+
+            # Mask fallback: use source mask aligned to target frame count.
+            mask_fb = _fit_frames(source_mask[b_idx].detach().cpu().float(), F)
+            if mask_fb.shape[1:] == (1, H, W):
+                mask_out[b_idx] = mask_fb
+            else:
+                mask_out[b_idx] = torch.ones((F, 1, H, W), dtype=torch.float32)
+
         for b in range(B):
-            sample_idx = int(batch["idx"][b].item()) if "idx" in batch else b
+            sample_idx = self._sample_idx_from_batch(batch, b)
 
             if self.use_official_infer:
                 _, mesh_path, hdr_path = self._sample_paths(b, sample_idx)
@@ -842,11 +939,8 @@ class Reli3DPipeline(BaselinePipeline):
                     target_lighting=target_lighting[b],
                 )
 
-            render_view = source_view[b] if self.render_source_for_debug else target_view[b]
-            render_Ks = source_Ks[b] if self.render_source_for_debug else target_Ks[b]
-            if self.render_source_for_debug and (not self._printed_source_render_debug_hint):
-                print("[ReLi3D debug] Rendering with source_view/source_K for sanity check.")
-                self._printed_source_render_debug_hint = True
+            render_view = target_view[b]
+            render_Ks = target_Ks[b]
 
             try:
                 rgb_np, depth_np, mask_np = self._render_with_blender(
@@ -896,14 +990,14 @@ class Reli3DPipeline(BaselinePipeline):
                         warnings.warn(
                             f"[ReLi3D] sample_idx={sample_idx}: retry failed, skip this case. err={retry_err}"
                         )
-                        mask_out[b] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+                        _fallback_to_source(b)
                         continue
 
                 if not retried:
                     warnings.warn(
                         f"[ReLi3D] sample_idx={sample_idx}: render failed, skip this case. err={e}"
                     )
-                    mask_out[b] = torch.zeros((F, 1, H, W), dtype=torch.float32)
+                    _fallback_to_source(b)
                     continue
 
             rgb_out[b] = torch.from_numpy(rgb_np)
